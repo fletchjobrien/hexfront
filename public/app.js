@@ -12,12 +12,8 @@ const PAD = 6;
 const ZOOM_MIN = 0.35;
 const ZOOM_MAX = 3;
 
-const TERRAIN_FILL = {
-  f: { seen: '#33503a', fog: '#18241b' },   // flat
-  h: { seen: '#6b5a37', fog: '#2c2619' },   // hills
-  w: { seen: '#1d3f66', fog: '#0f1f31' },   // water
-  m: { seen: '#575761', fog: '#26262c' },   // mountains
-};
+const TERRAIN_FILL = { f: '#33503a', h: '#6b5a37', w: '#1d3f66', m: '#575761' };
+const NEUTRAL_COLOR = '#9aa7b4';
 
 let CONFIG = null;
 let ME = null;
@@ -29,6 +25,7 @@ let authMode = 'login';
 let homeSignature = null;              // so polling doesn't rebuild an unchanged list
 let viewAs = 'all';                    // solo test games only
 let suppressClick = false;             // set while dragging, so a pan isn't a click
+let showLast = localStorage.getItem('hexfront.lastTurn') !== 'off';
 
 // 0 means "fit to the panel"; any other value is a fixed scale factor.
 let zoom = Number(localStorage.getItem('hexfront.zoom')) || 0;
@@ -57,6 +54,7 @@ function esc(s) {
 }
 
 function faction(id) {
+  if (id === -1) return { name: 'Free peoples', color: NEUTRAL_COLOR };
   return (CONFIG && CONFIG.factions[id]) || { name: 'Unknown', color: '#666' };
 }
 
@@ -389,17 +387,18 @@ function renderGame(s) {
         ? (waiting.length ? 'Waiting on: ' + waiting.join(', ') : 'Resolving...')
         : 'Move your armies, then submit. Orders resolve once everyone submits.';
 
+  // With no fog, everyone can see everyone's holdings - so show the scoreboard.
   el('game-players').innerHTML = s.players.map((p) => {
     const f = faction(p.faction);
-    const armies = s.units.filter((u) => u.faction === p.faction && u.kind === 'troop');
-    const strength = armies.reduce((n, u) => n + u.size, 0);
-    const showStrength = p.isYou || s.game.solo;
+    const own = s.units.filter((u) => u.faction === p.faction);
+    const strength = own.filter((u) => u.kind === 'troop').reduce((n, u) => n + u.size, 0);
+    const towns = own.filter((u) => u.kind !== 'troop').length;
     return '<div class="list-row">' +
       '<span class="swatch" style="background:' + f.color + '"></span>' +
       '<strong>' + esc(p.username) + '</strong>' +
       (p.isYou && !s.game.solo ? '<span class="tag">you</span>' : '') +
-      (showStrength ? '<span class="muted small">' + strength + ' str</span>' : '') +
       '<span class="spacer"></span>' +
+      '<span class="muted small">' + towns + ' held &middot; ' + strength + ' str</span>' +
       '<span class="tag ' + (p.submitted ? 'ok' : 'wait') + '">' + (p.submitted ? 'in' : 'thinking') + '</span></div>';
   }).join('');
 
@@ -416,9 +415,9 @@ function renderSeatPicker(s) {
   if (!s.game.solo) return;
 
   const wanted = String(s.game.viewAs);
-  const options = ['<option value="all">All factions (no fog)</option>'].concat(
+  const options = ['<option value="all">Commanding: all factions</option>'].concat(
     (s.game.factionsInPlay || []).map((f) =>
-      '<option value="' + f + '">See as ' + esc(faction(f).name) + '</option>'));
+      '<option value="' + f + '">Commanding: ' + esc(faction(f).name) + '</option>'));
   const markup = options.join('');
   if (picker.dataset.built !== markup) {
     picker.innerHTML = markup;
@@ -488,6 +487,12 @@ el('zoom-fit').addEventListener('click', () => {
 });
 window.addEventListener('resize', () => { if (!zoom) applyZoom(); });
 
+el('show-last').addEventListener('change', (e) => {
+  showLast = e.target.checked;
+  localStorage.setItem('hexfront.lastTurn', showLast ? 'on' : 'off');
+  if (STATE) renderMap(STATE);
+});
+
 // Ctrl/cmd + wheel zooms; a plain wheel still scrolls the board.
 el('map-scroll').addEventListener('wheel', (e) => {
   if (!e.ctrlKey && !e.metaKey) return;
@@ -532,8 +537,71 @@ el('map-scroll').addEventListener('wheel', (e) => {
 
 // ---------------------------------------------------------------- map
 
+// A capital is a skyline; a village is a hamlet. Both are drawn in the colour of
+// whoever holds them, so the map reads as territory at a glance.
+function settlementSvg(u, x, y, color) {
+  const capital = u.kind === 'city';
+  const bars = capital
+    ? [[-10, 9], [-5.5, 15], [-1, 11], [3.5, 17], [8, 8]]
+    : [[-7, 6], [-2.5, 9], [2, 6]];
+  const ground = y + 9;
+
+  let g = '<g class="unit settlement">';
+  for (const [bx, bh] of bars) {
+    g += '<rect class="building" x="' + (x + bx) + '" y="' + (ground - bh) +
+         '" width="4" height="' + bh + '" fill="' + color + '"></rect>';
+  }
+  g += '<rect class="building base" x="' + (x - 12) + '" y="' + ground +
+       '" width="24" height="3" fill="' + color + '"></rect>';
+  return g + '</g>';
+}
+
+// What happened when the last turn resolved: where armies walked, where they
+// fought, what changed hands. Deliberately faint - it is a footnote, not the
+// current position.
+function lastTurnSvg(s) {
+  const last = s.lastTurn;
+  if (!last || !showLast) return '';
+  const out = ['<g class="replay">'];
+
+  for (const m of last.moves || []) {
+    const [x1, y1] = center(m.from[0], m.from[1]);
+    const [x2, y2] = center(m.to[0], m.to[1]);
+    const color = faction(m.faction).color;
+    out.push('<line class="trace" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 +
+      '" stroke="' + color + '"></line>');
+    out.push('<circle class="trace-from" cx="' + x1 + '" cy="' + y1 + '" r="2.5" fill="' + color + '"></circle>');
+  }
+
+  // A fight is a small starburst; an army lost is a cross. Different shapes, so
+  // the two never read as the same thing.
+  for (const f of last.fights || []) {
+    const [x, y] = center(f.cx, f.cy);
+    const rays = [0, 60, 120].map((deg) => {
+      const a = (Math.PI / 180) * deg;
+      const dx = Math.cos(a) * 6, dy = Math.sin(a) * 6;
+      return 'M' + (x - dx).toFixed(1) + ' ' + (y - dy).toFixed(1) +
+             ' L' + (x + dx).toFixed(1) + ' ' + (y + dy).toFixed(1);
+    }).join(' ');
+    out.push('<g class="clash"><path d="' + rays + '"></path></g>');
+  }
+
+  for (const c of last.captures || []) {
+    const [x, y] = center(c.cx, c.cy);
+    out.push('<circle class="taken" cx="' + x + '" cy="' + y + '" r="13" stroke="' +
+      faction(c.by).color + '"></circle>');
+  }
+
+  for (const l of last.losses || []) {
+    const [x, y] = center(l.cx, l.cy);
+    out.push('<g class="wiped" stroke="' + faction(l.faction).color + '"><path d="M' + (x - 6) + ' ' + (y - 6) +
+      ' L' + (x + 6) + ' ' + (y + 6) + ' M' + (x + 6) + ' ' + (y - 6) + ' L' + (x - 6) + ' ' + (y + 6) + '"></path></g>');
+  }
+
+  return out.join('') + '</g>';
+}
+
 function renderMap(s) {
-  const visible = new Set(s.visible);
   const sel = s.units.find((u) => u.id === selected && u.mine && u.kind === 'troop') || null;
   if (!sel) selected = null;
 
@@ -551,8 +619,7 @@ function renderMap(s) {
   for (let cy = 0; cy < s.game.mapH; cy++) {
     for (let cx = 0; cx < s.game.mapW; cx++) {
       const [x, y] = center(cx, cy);
-      const seen = visible.has(cx + ',' + cy);
-      const fill = (TERRAIN_FILL[terrainAt(s, cx, cy)] || TERRAIN_FILL.f)[seen ? 'seen' : 'fog'];
+      const fill = TERRAIN_FILL[terrainAt(s, cx, cy)] || TERRAIN_FILL.f;
       out.push('<polygon class="hex" fill="' + fill + '" points="' + hexPath(x, y) +
         '" data-cx="' + cx + '" data-cy="' + cy + '"></polygon>');
     }
@@ -571,7 +638,10 @@ function renderMap(s) {
     out.push('<polygon class="overlay sel" points="' + hexPath(x, y) + '"></polygon>');
   }
 
-  // 3. ordered marches, drawn along the hexes the army actually walks
+  // 3. what happened last turn, under everything current
+  out.push(lastTurnSvg(s));
+
+  // 4. ordered marches, drawn along the hexes the army actually walks
   for (const [unitId, target] of Object.entries(s.orders || {})) {
     const u = s.units.find((n) => String(n.id) === String(unitId));
     if (!u) continue;
@@ -584,18 +654,19 @@ function renderMap(s) {
     out.push('<circle class="order-dot" cx="' + tx + '" cy="' + ty + '" r="8"></circle>');
   }
 
-  // 4. counters
+  // 5. settlements first, then armies on top of them
   for (const u of s.units) {
-    const f = faction(u.faction);
+    if (u.kind === 'troop') continue;
     const [x, y] = center(u.cx, u.cy);
-    if (u.kind === 'city') {
-      out.push('<g class="unit"><circle class="unit-city" cx="' + x + '" cy="' + y + '" r="11" fill="' + f.color + '"></circle>' +
-        '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="none" stroke="#0b0e13" stroke-width="2"></circle></g>');
-    } else {
-      out.push('<g class="unit">' +
-        '<rect class="unit-troop" x="' + (x - 11) + '" y="' + (y - 9) + '" width="22" height="18" rx="2" fill="' + f.color + '"></rect>' +
-        '<text class="unit-size" x="' + x + '" y="' + (y + 4.5) + '">' + u.size + '</text></g>');
-    }
+    out.push(settlementSvg(u, x, y, faction(u.faction).color));
+  }
+  for (const u of s.units) {
+    if (u.kind !== 'troop') continue;
+    const [x, y] = center(u.cx, u.cy);
+    out.push('<g class="unit">' +
+      '<rect class="unit-troop" x="' + (x - 11) + '" y="' + (y - 9) + '" width="22" height="18" rx="2" fill="' +
+      faction(u.faction).color + '"></rect>' +
+      '<text class="unit-size" x="' + x + '" y="' + (y + 4.5) + '">' + u.size + '</text></g>');
   }
 
   out.push('</svg>');
@@ -609,7 +680,7 @@ function renderMap(s) {
       : sel
         ? 'Selected army: size ' + sel.size + ', moves ' + sel.moves + ', damage ' + sel.damage +
           '. Hills cost 2; water and mountains are impassable.'
-        : 'Click an army to give it orders. Drag to pan, ctrl+scroll to zoom.';
+        : 'Click an army to give it orders. Move onto a village or city to take it. Drag to pan.';
 }
 
 el('map').addEventListener('click', async (e) => {

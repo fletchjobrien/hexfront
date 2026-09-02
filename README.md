@@ -4,9 +4,10 @@ A simultaneous-turn hex strategy game for a group of friends — Twilight Imperi
 scheming and Diplomacy's "everyone writes orders in secret, then they all resolve
 at once", on a hex-and-counter map.
 
-A randomly generated 24×24 map, six factions, a city and an army each, fog of
-war, terrain, dice combat, and a turn that resolves when everyone has submitted -
-or after 48 hours, whichever comes first.
+A randomly generated, perfectly symmetrical hex board; six factions with a
+capital and an army each; villages and a free city to fight over; terrain, dice
+combat, and a turn that resolves when everyone has submitted - or after 48
+hours, whichever comes first.
 
 Runs as a single Cloudflare Worker: static frontend + JSON API, with game state
 in D1 (Cloudflare's SQLite). No build step, no framework, no npm install needed
@@ -70,9 +71,8 @@ npx wrangler dev
 2. **Create lobby**, or **Join** someone else's from the games list.
 3. Everyone claims one of the six factions and hits **Ready up**. When all
    players in the lobby are ready (minimum 2), the game starts immediately.
-4. Each player sees only their own faction's view: hexes within sight of their
-   units, and enemy units only while they stand in that sight. The fog is applied
-   on the server, so it can't be peeled off by reading the network tab.
+4. The whole board is visible to everyone - there is no fog. What you cannot see
+   is what your rivals have *ordered*, which is where the bluffing lives.
 5. Click your army, click a hex within its movement to order a march, then
    **Submit turn**. The dashed line shows the route it will actually walk.
 6. When every player has submitted, all moves happen simultaneously and the next
@@ -83,21 +83,37 @@ npx wrangler dev
 
 | | |
 |---|---|
-| Map | 24×24 hexes, randomly generated per game |
+| Board | A hexagon of 397 hexes, randomly generated per game, ringed by open sea |
 | Terrain | **Flat** costs 1, **hills** cost 2, **water** and **mountains** are impassable |
-| Units | 1 city (never moves) and 1 army per faction |
+| Units | 1 capital (never moves) and 1 army per faction |
 | Army stats | **size** 10, **movement** 2, **damage** 3 |
-| Sight | 4 hexes from a city, 3 from an army |
-| Enemy city | Can't be entered — a march stops in front of it |
+| Settlements | Each player's capital, 18 free villages, and one free city in the middle |
+| Capturing | Walk onto a village to take it; a city must be beaten in battle first |
 | Turn length | 48 hours, or as soon as everyone submits |
 
-With 2 movement an army crosses two flat hexes, or one hill. Terrain is public —
-everyone sees the whole map; the fog hides armies, not geography.
+With 2 movement an army crosses two flat hexes, or one hill.
 
-Each map is generated fresh: smoothed noise cut at fixed quantiles, so the mix
-of land and water stays roughly constant. Every faction gets open ground around
-its city, and the generator guarantees all six starts can reach each other on
-foot — otherwise a game could be decided by an unlucky mountain range.
+### An even start
+
+The board has **six-fold rotational symmetry**. Whatever terrain one player has,
+every other player has exactly the same, turned 60°. That is enforced by
+generating the noise per *canonical* hex — the smallest of a hex's six rotations
+— so all six copies share one value by construction rather than being nudged
+into fairness afterwards.
+
+The playable area is a hexagon of radius 11 inscribed in the square grid, with
+open sea beyond it. A square has no six-fold symmetry, so its corners would have
+handed some players more room than others.
+
+Villages follow the same rule: two spots are chosen near one capital and one on
+the border between two, then each is rotated onto all six positions. Every player
+therefore has **two private villages** at identical walking distance, and there
+is **one contested village on each of the six borders**, plus the free city in
+the middle that everybody can reach equally. The private ones are yours for the
+taking; the seven in between are not enough to go round.
+
+The generator also checks that every capital, village and the centre is
+reachable on foot, and carves a corridor (in all six rotations) if not.
 
 ### How a turn resolves
 
@@ -132,12 +148,15 @@ to finish off — but a d6 swing of 5 is worth 15 points of size, so a small arm
 can still upset a big one.
 
 Fights are written to the shared log with both rolls, so everyone can see how it
-went. Coordinates are deliberately left out so the log doesn't leak positions
-through the fog.
+went. The board also shows a faint replay of the turn that just resolved - where
+armies walked, a starburst where they fought, a dashed ring on anything that
+changed hands, a cross where an army was destroyed. Untick **Last turn** above
+the board to hide it.
 
 All of these numbers live at the top of [`src/game.js`](src/game.js) — `START`
-(size, moves, damage), `DICE`, `SIZE_PER_BONUS`, `VISION`, `TURN_HOURS`, and the
-`FACTIONS` table with each faction's name, colour and starting position.
+(size, moves, damage), `CITY`, `VILLAGE`, `DICE`, `SIZE_PER_BONUS`, `TURN_HOURS`
+and the `FACTIONS` table. The map's shape and village placement are the
+constants at the top of [`src/terrain.js`](src/terrain.js).
 
 ---
 
@@ -147,9 +166,9 @@ All of these numbers live at the top of [`src/game.js`](src/game.js) — `START`
 wrangler.jsonc     Worker config: D1 binding, static assets, cron trigger
 schema.sql         Database tables
 src/index.js       HTTP layer: accounts, sessions, lobby and order endpoints
-src/game.js        Rules: setup, fog of war, simultaneous movement and combat
+src/game.js        Rules: setup, simultaneous movement, combat and capture
 src/hex.js         Hex coordinates, terrain costs and routing
-src/terrain.js     Random map generation
+src/terrain.js     Symmetric map generation and settlement placement
 public/index.html  Landing page, lobby and game shell
 public/app.js      Client: SVG map, order entry, polling
 public/style.css   Styling
@@ -164,10 +183,9 @@ mismatch shows up as a drawn route that doesn't match what actually happened.
 
 Tick **"Test game"** when creating a game and it skips the lobby entirely: you
 get a map with all six factions on it and you command every one of them. The
-dropdown above the board switches between *All factions (no fog)* and looking
-through any single faction's eyes, which is the only practical way to check that
-the fog behaves. Submitting resolves the turn immediately, since you are the
-only player.
+dropdown above the board chooses which faction you are giving orders to, or all
+six at once. Submitting resolves the turn immediately, since you are the only
+player.
 
 ### Upgrading an existing database
 
@@ -180,6 +198,7 @@ ALTER TABLE units ADD COLUMN moves INTEGER NOT NULL DEFAULT 2;
 ALTER TABLE units ADD COLUMN damage INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE games ADD COLUMN terrain TEXT;
 ALTER TABLE games ADD COLUMN solo INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE games ADD COLUMN last_turn TEXT;
 ```
 
 SQLite has no `ADD COLUMN IF NOT EXISTS`, so a column you already have will
@@ -199,8 +218,8 @@ sed -e 's/[[:space:]]*--.*$//' schema.sql | grep -v '^[[:space:]]*$'
 
 Roughly in order of "most game for the least code":
 
-- **Taking cities.** Cities block entry but never fall. Let an army that beats a
-  city besiege and capture it, and add a victory condition.
+- **A victory condition.** Settlements can be taken but nothing ends the game -
+  first to hold N of them, or hold the middle for N turns, is the obvious start.
 - **Reinforcements.** Cities produce a new army, or add size to a nearby one,
   every few turns - otherwise attrition just ends the game.
 - **Diplomacy.** Private messages between players, and formal alliances whose

@@ -1,31 +1,38 @@
-// Game rules: setup, fog of war, simultaneous movement and combat.
+// Game rules: setup, simultaneous movement, combat and capture.
 
 import {
   MAP_W, MAP_H, inBounds, distance, key, walkPath, neighbors, passable,
 } from './hex.js';
-import { generateTerrain } from './terrain.js';
+import { generateMap } from './terrain.js';
 
-export const VISION = { city: 4, troop: 3 };
 export const TURN_HOURS = 48;              // auto-resolve deadline
 export const MAX_PLAYERS = 6;
 export const MIN_PLAYERS = 2;
+export const NEUTRAL = -1;
 
 // Army stats. Size doubles as strength and hit points: it adds to the combat
 // roll, and it is what damage eats away at.
 export const START = { size: 10, moves: 2, damage: 3 };
+export const CITY = { size: 10, moves: 0, damage: 3 };     // capitals defend themselves
+export const VILLAGE = { size: 0, moves: 0, damage: 0 };   // villages just change hands
 export const DICE = 6;                     // one dN per side, per fight
 export const SIZE_PER_BONUS = 3;           // +1 to the roll per this much size
 
 export const FACTIONS = [
-  { id: 0, name: 'Crimson Dominion',  color: '#ef4444', city: [11, 2],  troop: [11, 3]  },
-  { id: 1, name: 'Azure Compact',     color: '#3b82f6', city: [20, 7],  troop: [20, 8]  },
-  { id: 2, name: 'Verdant Concord',   color: '#22c55e', city: [20, 17], troop: [20, 16] },
-  { id: 3, name: 'Golden Ascendancy', color: '#eab308', city: [11, 21], troop: [11, 20] },
-  { id: 4, name: 'Violet Syndicate',  color: '#a855f7', city: [3, 17],  troop: [4, 16]  },
-  { id: 5, name: 'Amber Coalition',   color: '#f97316', city: [3, 7],   troop: [4, 8]   },
+  { id: 0, name: 'Crimson Dominion',  color: '#ef4444' },
+  { id: 1, name: 'Azure Compact',     color: '#3b82f6' },
+  { id: 2, name: 'Verdant Concord',   color: '#22c55e' },
+  { id: 3, name: 'Golden Ascendancy', color: '#eab308' },
+  { id: 4, name: 'Violet Syndicate',  color: '#a855f7' },
+  { id: 5, name: 'Amber Coalition',   color: '#f97316' },
 ];
 
 export const TURN_MS = TURN_HOURS * 60 * 60 * 1000;
+
+export function factionName(id) {
+  if (id === NEUTRAL) return 'Free peoples';
+  return (FACTIONS[id] || { name: 'Unknown' }).name;
+}
 
 function logStmt(env, gameId, turn, text) {
   return env.DB.prepare('INSERT INTO events (game_id, turn, text, created_at) VALUES (?,?,?,?)')
@@ -35,23 +42,24 @@ function logStmt(env, gameId, turn, text) {
 // ---------------------------------------------------------------- setup
 
 export async function startGame(env, game, factionIds) {
-  const terrain = generateTerrain(FACTIONS.map((f) => f.city));
+  const map = generateMap();
 
-  // Claim the transition so two simultaneous "ready" clicks can't both start it.
   const claim = await env.DB.prepare(
     "UPDATE games SET status='active', turn=1, deadline_at=?, terrain=? WHERE id=? AND status='lobby'"
-  ).bind(Date.now() + TURN_MS, terrain, game.id).run();
+  ).bind(Date.now() + TURN_MS, map.terrain, game.id).run();
   if (!claim.meta.changes) return false;
 
-  const insert = (faction, kind, spot, stats) => env.DB.prepare(
+  const insert = (faction, kind, cx, cy, stats) => env.DB.prepare(
     'INSERT INTO units (game_id, faction, kind, cx, cy, size, moves, damage) VALUES (?,?,?,?,?,?,?,?)'
-  ).bind(game.id, faction, kind, spot[0], spot[1], stats.size, stats.moves, stats.damage);
+  ).bind(game.id, faction, kind, cx, cy, stats.size, stats.moves, stats.damage);
 
   const stmts = [];
   for (const id of factionIds) {
-    const f = FACTIONS[id];
-    stmts.push(insert(id, 'city', f.city, { size: START.size, moves: 0, damage: 0 }));
-    stmts.push(insert(id, 'troop', f.troop, START));
+    stmts.push(insert(id, 'city', map.cities[id][0], map.cities[id][1], CITY));
+    stmts.push(insert(id, 'troop', map.troops[id][0], map.troops[id][1], START));
+  }
+  for (const s of map.settlements) {
+    stmts.push(insert(NEUTRAL, s.kind, s.cx, s.cy, s.kind === 'city' ? CITY : VILLAGE));
   }
   stmts.push(env.DB.prepare('UPDATE players SET submitted=0 WHERE game_id=?').bind(game.id));
   stmts.push(logStmt(env, game.id, 1, 'Game started - turn 1 orders are open.'));
@@ -66,12 +74,11 @@ function bonus(size) {
 }
 
 // A beaten army falls back one hex, as far from the winner as it can get.
-function retreat(loser, winner, actors, terrain, cityOwner) {
+function retreat(loser, winner, actors, terrain) {
   const options = neighbors(loser.cx, loser.cy).filter(([cx, cy]) => {
     if (!passable(terrain, cx, cy)) return false;
-    const owner = cityOwner.get(key(cx, cy));
-    if (owner !== undefined && owner !== loser.faction) return false;
-    return !actors.some((a) => !a.dead && a.faction !== loser.faction && a.cx === cx && a.cy === cy);
+    return !actors.some((a) => !a.dead && a.kind === 'troop' &&
+      a.faction !== loser.faction && a.cx === cx && a.cy === cy);
   });
   if (!options.length) return false;
   options.sort((p, q) =>
@@ -87,7 +94,7 @@ function retreat(loser, winner, actors, terrain, cityOwner) {
 //
 // However it ends, every army involved is finished moving for the turn - that is
 // what makes contact interrupt a march.
-function fight(group, dest, actors, terrain, cityOwner, roll, events) {
+function fight(group, dest, actors, terrain, roll, events, report) {
   const rolls = group.map((a) => {
     const r = roll();
     return { a, r, score: r + bonus(a.size) };
@@ -96,33 +103,47 @@ function fight(group, dest, actors, terrain, cityOwner, roll, events) {
 
   for (const x of rolls) x.a.stopped = true;
 
+  const spot = dest || [rolls[0].a.cx, rolls[0].a.cy];
   const detail = rolls
-    .map((x) => `${x.a.name} (size ${x.a.size}) rolled ${x.r}+${bonus(x.a.size)}=${x.score}`)
+    .map((x) => `${x.a.name} (${x.a.kind === 'city' ? 'city, ' : ''}size ${x.a.size}) rolled ${x.r}+${bonus(x.a.size)}=${x.score}`)
     .join(' vs ');
 
   if (rolls[1] && rolls[0].score === rolls[1].score) {
     events.push(`${detail} - stalemate, both held their ground.`);
+    report.fights.push({ cx: spot[0], cy: spot[1], winner: null });
     return;
   }
 
   const winner = rolls[0].a;
-  if (dest) {
+  if (dest && winner.kind === 'troop') {
     winner.cx = dest[0];
     winner.cy = dest[1];
   }
 
   const outcomes = [];
   for (const { a: loser } of rolls.slice(1)) {
+    // A settlement that loses changes hands rather than dying.
+    if (loser.kind !== 'troop') {
+      const from = loser.faction;
+      loser.faction = winner.faction;
+      loser.captured = true;
+      report.captures.push({ cx: loser.cx, cy: loser.cy, kind: loser.kind, by: winner.faction, from });
+      outcomes.push(`${winner.name} stormed the ${loser.kind}`);
+      continue;
+    }
+
     loser.size -= winner.damage;
     if (loser.size <= 0) {
       loser.dead = true;
+      report.losses.push({ cx: loser.cx, cy: loser.cy, faction: loser.faction });
       outcomes.push(`${loser.name}'s army was wiped out`);
       continue;
     }
-    const fellBack = retreat(loser, winner, actors, terrain, cityOwner);
+    const fellBack = retreat(loser, winner, actors, terrain);
     outcomes.push(`${loser.name} lost ${winner.damage} and ${fellBack ? 'retreated' : 'was pinned with nowhere to retreat'} (size ${loser.size})`);
   }
   events.push(`${detail} - ${winner.name} won; ${outcomes.join('; ')}.`);
+  report.fights.push({ cx: spot[0], cy: spot[1], winner: winner.faction });
 }
 
 function sameHex(a, b) {
@@ -134,49 +155,60 @@ function sameHex(a, b) {
 // Armies move one hex at a time, in lockstep. After every step the board is
 // checked for three things, any of which starts a fight:
 //
-//   * two factions ending up on the same hex
+//   * two factions ending up on the same hex (including walking into a city)
 //   * two armies trying to trade places
 //   * an army moving into contact - finishing a step next to an enemy
 //
-// The third is what stops a march dead when it runs into someone. Together they
-// make it impossible to slip past, through, or around an enemy army unnoticed.
+// Villages have no garrison, so an army simply takes one by standing on it.
 
 export function simulateTurn(units, orders, terrain, rng = Math.random) {
   const roll = () => 1 + Math.floor(rng() * DICE);
   const events = [];
+  const report = { moves: [], fights: [], captures: [], losses: [] };
   const ordered = new Map(orders.map((o) => [o.unit_id, o]));
-
-  const cityOwner = new Map();
-  for (const u of units) if (u.kind === 'city') cityOwner.set(key(u.cx, u.cy), u.faction);
 
   const actors = units.map((u) => ({
     id: u.id,
     faction: u.faction,
     kind: u.kind,
-    name: (FACTIONS[u.faction] || { name: 'Unknown' }).name,
+    name: factionName(u.faction),
     cx: u.cx, cy: u.cy,
     startCx: u.cx, startCy: u.cy,
     size: u.size, moves: u.moves, damage: u.damage,
-    startSize: u.size,
+    startSize: u.size, startFaction: u.faction,
     path: [],
     stopped: u.kind !== 'troop',
     dead: false,
+    captured: false,
   }));
 
   for (const a of actors) {
     if (a.kind !== 'troop') continue;
     const o = ordered.get(a.id);
     if (!o || !inBounds(o.cx, o.cy)) continue;
-
-    const path = walkPath(terrain, a.cx, a.cy, o.cx, o.cy, a.moves);
-    // An enemy city is a wall for now - stop the march in front of it.
-    const blocked = path.findIndex(([cx, cy]) => {
-      const owner = cityOwner.get(key(cx, cy));
-      return owner !== undefined && owner !== a.faction;
-    });
-    a.path = blocked === -1 ? path : path.slice(0, blocked);
+    a.path = walkPath(terrain, a.cx, a.cy, o.cx, o.cy, a.moves);
     a.stopped = a.path.length === 0;
   }
+
+  const villageAt = () => {
+    const m = new Map();
+    for (const a of actors) if (a.kind === 'village' && !a.dead) m.set(key(a.cx, a.cy), a);
+    return m;
+  };
+
+  const takeVillages = () => {
+    const villages = villageAt();
+    for (const a of actors) {
+      if (a.kind !== 'troop' || a.dead) continue;
+      const v = villages.get(key(a.cx, a.cy));
+      if (!v || v.faction === a.faction) continue;
+      const from = v.faction;
+      v.faction = a.faction;
+      v.captured = true;
+      report.captures.push({ cx: v.cx, cy: v.cy, kind: 'village', by: a.faction, from });
+      events.push(`${a.name} took a village${from === NEUTRAL ? '' : ' from ' + factionName(from)}.`);
+    }
+  };
 
   const maxSteps = actors.reduce((n, a) => Math.max(n, a.path.length), 0);
 
@@ -192,9 +224,10 @@ export function simulateTurn(units, orders, terrain, rng = Math.random) {
     const busy = new Set();
     const conflicts = [];
 
-    // Two factions want the same hex.
+    // Two factions want the same hex. Villages sit this out - they have no garrison.
     const groups = new Map();
     for (const a of alive) {
+      if (a.kind === 'village') continue;
       const spot = intent.get(a.id);
       const k = key(spot[0], spot[1]);
       if (!groups.has(k)) groups.set(k, []);
@@ -211,6 +244,7 @@ export function simulateTurn(units, orders, terrain, rng = Math.random) {
     for (let i = 0; i < alive.length; i++) {
       for (let j = i + 1; j < alive.length; j++) {
         const a = alive[i], b = alive[j];
+        if (a.kind !== 'troop' || b.kind !== 'troop') continue;
         if (a.faction === b.faction || busy.has(a.id) || busy.has(b.id)) continue;
         const ia = intent.get(a.id), ib = intent.get(b.id);
         if (ia[0] === b.cx && ia[1] === b.cy && ib[0] === a.cx && ib[1] === a.cy) {
@@ -228,7 +262,7 @@ export function simulateTurn(units, orders, terrain, rng = Math.random) {
       a.cy = spot[1];
     }
 
-    for (const c of conflicts) fight(c.group, c.dest, actors, terrain, cityOwner, roll, events);
+    for (const c of conflicts) fight(c.group, c.dest, actors, terrain, roll, events, report);
 
     // Contact: an army that moved this step and finished it beside an enemy.
     const armies = actors.filter((a) => !a.dead && a.kind === 'troop');
@@ -237,23 +271,33 @@ export function simulateTurn(units, orders, terrain, rng = Math.random) {
         const a = armies[i], b = armies[j];
         if (a.faction === b.faction || busy.has(a.id) || busy.has(b.id)) continue;
         if (distance(a.cx, a.cy, b.cx, b.cy) !== 1) continue;
-        // Armies that were already sitting next to each other stay at their standoff.
         if (sameHex(before.get(a.id), [a.cx, a.cy]) && sameHex(before.get(b.id), [b.cx, b.cy])) continue;
         busy.add(a.id);
         busy.add(b.id);
-        fight([a, b], null, actors, terrain, cityOwner, roll, events);
+        fight([a, b], null, actors, terrain, roll, events, report);
       }
+    }
+
+    takeVillages();
+  }
+
+  for (const a of actors) {
+    if (a.kind === 'troop' && !a.dead && (a.cx !== a.startCx || a.cy !== a.startCy)) {
+      report.moves.push({ faction: a.faction, from: [a.startCx, a.startCy], to: [a.cx, a.cy] });
     }
   }
 
   return {
     events,
+    report,
     results: actors.map((a) => ({
       id: a.id,
       cx: a.cx, cy: a.cy,
       size: a.size,
+      faction: a.faction,
       dead: a.dead,
-      changed: a.dead || a.cx !== a.startCx || a.cy !== a.startCy || a.size !== a.startSize,
+      changed: a.dead || a.cx !== a.startCx || a.cy !== a.startCy ||
+               a.size !== a.startSize || a.faction !== a.startFaction,
     })),
   };
 }
@@ -267,12 +311,12 @@ export async function resolveTurn(env, game, reason) {
   const orders = (await env.DB.prepare('SELECT * FROM orders WHERE game_id=? AND turn=?')
     .bind(game.id, turn).all()).results;
 
-  const { results, events } = simulateTurn(units, orders, game.terrain);
+  const { results, events, report } = simulateTurn(units, orders, game.terrain);
+  report.turn = turn;
 
-  // Claim the turn advance; if someone else already advanced it, do nothing.
   const claim = await env.DB.prepare(
-    "UPDATE games SET turn = turn + 1, deadline_at = ? WHERE id = ? AND turn = ? AND status = 'active'"
-  ).bind(Date.now() + TURN_MS, game.id, turn).run();
+    "UPDATE games SET turn = turn + 1, deadline_at = ?, last_turn = ? WHERE id = ? AND turn = ? AND status = 'active'"
+  ).bind(Date.now() + TURN_MS, JSON.stringify(report), game.id, turn).run();
   if (!claim.meta.changes) return false;
 
   const stmts = [];
@@ -281,8 +325,8 @@ export async function resolveTurn(env, game, reason) {
     if (r.dead) {
       stmts.push(env.DB.prepare('DELETE FROM units WHERE id=?').bind(r.id));
     } else {
-      stmts.push(env.DB.prepare('UPDATE units SET cx=?, cy=?, size=? WHERE id=?')
-        .bind(r.cx, r.cy, r.size, r.id));
+      stmts.push(env.DB.prepare('UPDATE units SET cx=?, cy=?, size=?, faction=? WHERE id=?')
+        .bind(r.cx, r.cy, r.size, r.faction, r.id));
     }
   }
   stmts.push(env.DB.prepare('UPDATE players SET submitted=0 WHERE game_id=?').bind(game.id));
@@ -322,14 +366,10 @@ export async function resolveExpiredGames(env) {
   return games.length;
 }
 
-// ---------------------------------------------------------------- fog of war
+// ---------------------------------------------------------------- state
 
-// Builds the view for one player. Hexes outside their sight are never sent, so
-// the fog can't be peeled off by reading the network tab. Terrain is public -
-// the fog hides armies, not geography.
-//
-// In a solo test game one person drives every faction, so `viewAs` chooses whose
-// eyes to look through, or 'all' to switch the fog off entirely.
+// The whole board is public - there is no fog. `viewAs` only decides which
+// faction's armies a solo test player is currently commanding.
 export async function buildState(env, game, userId, viewAs) {
   const players = (await env.DB.prepare(
     'SELECT p.*, u.username FROM players p JOIN users u ON u.id = p.user_id WHERE p.game_id = ? ORDER BY p.faction'
@@ -342,11 +382,11 @@ export async function buildState(env, game, userId, viewAs) {
     ? (await env.DB.prepare('SELECT * FROM units WHERE game_id=?').bind(game.id).all()).results
     : [];
 
-  const inPlay = [...new Set(units.map((u) => u.faction))].sort((a, b) => a - b);
-  const revealAll = solo && (viewAs === 'all' || viewAs === undefined || viewAs === null);
-  const seat = solo
-    ? (revealAll ? null : Number(viewAs))
-    : (member ? member.faction : null);
+  const inPlay = solo
+    ? FACTIONS.map((f) => f.id)
+    : players.map((p) => p.faction);
+  const commandAll = solo && (viewAs === 'all' || viewAs === undefined || viewAs === null);
+  const seat = solo ? (commandAll ? null : Number(viewAs)) : (member ? member.faction : null);
 
   const state = {
     game: {
@@ -363,7 +403,7 @@ export async function buildState(env, game, userId, viewAs) {
       solo,
       terrain: game.terrain || null,
       factionsInPlay: inPlay,
-      viewAs: solo ? (revealAll ? 'all' : String(seat)) : null,
+      viewAs: solo ? (commandAll ? 'all' : String(seat)) : null,
     },
     you: member
       ? {
@@ -375,7 +415,7 @@ export async function buildState(env, game, userId, viewAs) {
       : null,
     players: solo
       ? inPlay.map((f) => ({
-          username: (FACTIONS[f] || { name: 'Faction ' + f }).name,
+          username: factionName(f),
           faction: f,
           ready: true,
           submitted: !!member.submitted,
@@ -388,40 +428,19 @@ export async function buildState(env, game, userId, viewAs) {
           submitted: !!p.submitted,
           isYou: p.user_id === userId,
         })),
-    units: [],
-    visible: [],
+    units: units.map((u) => ({
+      id: u.id, faction: u.faction, kind: u.kind, cx: u.cx, cy: u.cy,
+      size: u.size, moves: u.moves, damage: u.damage,
+      mine: u.kind === 'troop' && (solo ? (commandAll || u.faction === seat) : u.faction === seat),
+    })),
+    lastTurn: game.last_turn ? safeParse(game.last_turn) : null,
     orders: {},
     log: [],
   };
 
   if (game.status !== 'active') return state;
 
-  const visible = new Set();
-  if (revealAll) {
-    for (let cy = 0; cy < MAP_H; cy++) for (let cx = 0; cx < MAP_W; cx++) visible.add(key(cx, cy));
-  } else if (seat !== null) {
-    for (const u of units.filter((u) => u.faction === seat)) {
-      const r = VISION[u.kind] || 0;
-      for (let cy = Math.max(0, u.cy - r); cy <= Math.min(MAP_H - 1, u.cy + r); cy++) {
-        for (let cx = Math.max(0, u.cx - r - 1); cx <= Math.min(MAP_W - 1, u.cx + r + 1); cx++) {
-          if (distance(u.cx, u.cy, cx, cy) <= r) visible.add(key(cx, cy));
-        }
-      }
-    }
-  }
-  state.visible = [...visible];
-
-  for (const u of units) {
-    const yours = solo ? (revealAll || u.faction === seat) : (!!member && u.faction === seat);
-    if (!yours && !visible.has(key(u.cx, u.cy))) continue;
-    state.units.push({
-      id: u.id, faction: u.faction, kind: u.kind, cx: u.cx, cy: u.cy,
-      size: u.size, moves: u.moves, damage: u.damage, mine: yours,
-    });
-  }
-
   if (member) {
-    // A solo player owns every army, so they see every standing order.
     const rows = solo
       ? (await env.DB.prepare('SELECT * FROM orders WHERE game_id=? AND turn=?')
           .bind(game.id, game.turn).all()).results
@@ -436,4 +455,8 @@ export async function buildState(env, game, userId, viewAs) {
   ).bind(game.id).all()).results;
 
   return state;
+}
+
+function safeParse(text) {
+  try { return JSON.parse(text); } catch { return null; }
 }

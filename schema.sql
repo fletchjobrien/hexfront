@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS games (
   host_id     INTEGER NOT NULL,
   created_at  INTEGER NOT NULL,
   terrain     TEXT,
-  solo        INTEGER NOT NULL DEFAULT 0
+  solo        INTEGER NOT NULL DEFAULT 0,
+  last_turn   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS players (
@@ -40,8 +41,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS players_faction_unique ON players(game_id, fac
 CREATE TABLE IF NOT EXISTS units (
   id      INTEGER PRIMARY KEY AUTOINCREMENT,
   game_id INTEGER NOT NULL,
-  faction INTEGER NOT NULL,
-  kind    TEXT    NOT NULL,                        -- city | troop
+  faction INTEGER NOT NULL,                        -- -1 for unclaimed
+  kind    TEXT    NOT NULL,                        -- city | village | troop
   cx      INTEGER NOT NULL,
   cy      INTEGER NOT NULL,
   size    INTEGER NOT NULL DEFAULT 10,

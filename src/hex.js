@@ -46,6 +46,22 @@ export function neighbors(cx, cy) {
   return CUBE_DIRS.map((d) => toOffset(x + d[0], z + d[2]));
 }
 
+// Turn a cube vector by 60 degrees, `times` times. Six of these bring you back
+// where you started, which is what makes a six-player map symmetrical.
+export function rotate60(d, times) {
+  let [x, y, z] = d;
+  for (let i = ((times % 6) + 6) % 6; i > 0; i--) [x, y, z] = [-z, -x, -y];
+  return [x, y, z];
+}
+
+// The same hex seen from a rotation of the board about `centre`.
+export function rotateAround(cx, cy, centre, times) {
+  const c = toCube(centre[0], centre[1]);
+  const p = toCube(cx, cy);
+  const d = rotate60([p[0] - c[0], p[1] - c[1], p[2] - c[2]], times);
+  return toOffset(c[0] + d[0], c[2] + d[2]);
+}
+
 // ---------------------------------------------------------------- terrain
 
 export function terrainAt(terrain, cx, cy) {

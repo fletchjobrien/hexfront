@@ -144,6 +144,21 @@ label input { margin-top: .25rem; }
   fill: #0b0e13; text-anchor: middle; pointer-events: none;
 }
 
+.building { stroke: #0b0e13; stroke-width: 1; }
+.building.base { stroke-width: .8; }
+
+/* Last turn's events: a footnote under the current position, never competing
+   with it. */
+.replay { pointer-events: none; }
+.replay .trace { stroke-width: 1.8; stroke-dasharray: 3 5; opacity: .4; }
+.replay .trace-from { opacity: .45; }
+.replay .clash path { stroke: #f2c14e; stroke-width: 1.6; opacity: .55; fill: none; stroke-linecap: round; }
+.replay .taken { fill: none; stroke-width: 1.6; stroke-dasharray: 4 4; opacity: .65; }
+.replay .wiped path { stroke-width: 2; opacity: .5; fill: none; stroke-linecap: round; }
+
+.toolbar-check { display: flex; align-items: center; gap: .3rem; margin: 0; font-size: .8rem; }
+.toolbar-check input { width: auto; }
+
 .legend { display: flex; align-items: center; gap: .3rem; font-size: .78rem; color: var(--muted); }
 .legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; margin-left: .5rem; }
 
