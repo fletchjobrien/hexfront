@@ -1,0 +1,14 @@
+{
+  "name": "hexfront",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init:local": "wrangler d1 execute hexfront --local --file=./schema.sql",
+    "db:init:remote": "wrangler d1 execute hexfront --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0"
+  }
+}

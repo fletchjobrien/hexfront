@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hexfront",
+  "main": "src/index.js",
+  "compatibility_date": "2025-06-01",
+  "observability": { "enabled": true },
+
+  // Static frontend. Anything that matches a file in ./public is served
+  // directly; everything else (i.e. /api/*) falls through to the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+
+  // Create with:  npx wrangler d1 create hexfront
+  // then paste the printed database_id here.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hexfront",
+      "database_id": "PASTE_YOUR_D1_DATABASE_ID_HERE"
+    }
+  ],
+
+  // Auto-resolves any turn whose deadline has passed, even if nobody visits.
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  }
+}

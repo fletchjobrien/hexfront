@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HexFront</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><polygon points='16,2 29,9.5 29,24.5 16,32 3,24.5 3,9.5' fill='%23e2b13c'/></svg>">
+</head>
+<body>
+
+<header id="topbar" hidden>
+  <a class="brand" href="#/">HEX<span>FRONT</span></a>
+  <div class="spacer"></div>
+  <span id="whoami" class="muted"></span>
+  <button id="logout" class="ghost">Log out</button>
+</header>
+
+<!-- ---------------------------------------------------------- landing -->
+<main id="view-login" class="view">
+  <div class="landing">
+    <div class="landing-copy">
+      <h1>HEX<span>FRONT</span></h1>
+      <p class="tagline">Simultaneous-turn hex strategy for friends who live too far apart.</p>
+      <ul class="bullets">
+        <li>Everyone writes orders in secret; the turn resolves once all are in.</li>
+        <li>Miss a turn? It auto-resolves after 48 hours and your units hold position.</li>
+        <li>Six factions, one 24&times;24 map, fog of war you can't peek around.</li>
+      </ul>
+    </div>
+
+    <form id="auth-form" class="card">
+      <h2 id="auth-title">Sign in</h2>
+      <label>Name
+        <input id="auth-user" autocomplete="username" required maxlength="20" placeholder="your callsign">
+      </label>
+      <label>Password
+        <input id="auth-pass" type="password" autocomplete="current-password" required minlength="6" placeholder="at least 6 characters">
+      </label>
+      <label id="auth-code-row" hidden>Invite code
+        <input id="auth-code" autocomplete="off" placeholder="from your host">
+      </label>
+      <button id="auth-submit" class="primary" type="submit">Sign in</button>
+      <p id="auth-error" class="error" hidden></p>
+      <p class="muted small">
+        <span id="auth-switch-text">No account yet?</span>
+        <a href="#" id="auth-switch">Create one</a>
+      </p>
+    </form>
+  </div>
+</main>
+
+<!-- ---------------------------------------------------------- game list -->
+<main id="view-home" class="view" hidden>
+  <section class="card">
+    <h2>Start a game</h2>
+    <form id="create-form" class="row">
+      <input id="create-name" placeholder="Game name" maxlength="40">
+      <button class="primary" type="submit">Create lobby</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Games</h2>
+    <div id="game-list" class="list"></div>
+  </section>
+</main>
+
+<!-- ---------------------------------------------------------- lobby -->
+<main id="view-lobby" class="view" hidden>
+  <section class="card">
+    <div class="row between">
+      <h2 id="lobby-name">Lobby</h2>
+      <button id="lobby-leave" class="ghost">Leave</button>
+    </div>
+    <p class="muted small" id="lobby-hint">Pick a faction, then ready up. The game starts when everyone is ready.</p>
+    <div id="faction-grid" class="faction-grid"></div>
+    <div class="row">
+      <button id="ready-btn" class="primary">Ready up</button>
+      <span id="lobby-status" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Players</h2>
+    <div id="lobby-players" class="list"></div>
+    <p class="muted small">Share this page's link with your friends so they can join.</p>
+  </section>
+</main>
+
+<!-- ---------------------------------------------------------- game -->
+<main id="view-game" class="view wide" hidden>
+  <div class="board-wrap">
+    <div id="map"></div>
+    <p id="map-hint" class="muted small"></p>
+  </div>
+
+  <aside class="side">
+    <section class="card">
+      <h2 id="game-name">Game</h2>
+      <div class="turnline">
+        <span class="turn" id="turn-no">Turn 1</span>
+        <span class="muted small" id="deadline"></span>
+      </div>
+      <button id="submit-btn" class="primary wide-btn">Submit turn</button>
+      <p class="muted small" id="submit-hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Factions</h2>
+      <div id="game-players" class="list compact"></div>
+    </section>
+
+    <section class="card">
+      <h2>Log</h2>
+      <div id="game-log" class="list compact log"></div>
+    </section>
+  </aside>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
