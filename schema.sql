@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS units (
   faction INTEGER NOT NULL,
   kind    TEXT    NOT NULL,                        -- city | troop
   cx      INTEGER NOT NULL,
-  cy      INTEGER NOT NULL
+  cy      INTEGER NOT NULL,
+  size    INTEGER NOT NULL DEFAULT 10,
+  moves   INTEGER NOT NULL DEFAULT 2,
+  damage  INTEGER NOT NULL DEFAULT 3
 );
 CREATE INDEX IF NOT EXISTS units_game ON units(game_id);
 

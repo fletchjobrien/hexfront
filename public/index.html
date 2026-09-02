@@ -91,7 +91,17 @@
 <!-- ---------------------------------------------------------- game -->
 <main id="view-game" class="view wide" hidden>
   <div class="board-wrap">
-    <div id="map"></div>
+    <div class="board-tools">
+      <button id="zoom-out" class="ghost" title="Zoom out">&minus;</button>
+      <span id="zoom-level" class="muted small">100%</span>
+      <button id="zoom-in" class="ghost" title="Zoom in">+</button>
+      <button id="zoom-fit" class="ghost">Fit</button>
+      <span class="spacer"></span>
+      <span class="muted small">Ctrl+scroll to zoom</span>
+    </div>
+    <div id="map-scroll">
+      <div id="map"></div>
+    </div>
     <p id="map-hint" class="muted small"></p>
   </div>
 

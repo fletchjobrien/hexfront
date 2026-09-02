@@ -5,7 +5,7 @@
 
 import { inBounds, distance } from './hex.js';
 import {
-  FACTIONS, MAX_PLAYERS, MIN_PLAYERS, MOVE_POINTS, TURN_HOURS,
+  FACTIONS, MAX_PLAYERS, MIN_PLAYERS, START, DICE, SIZE_PER_BONUS, TURN_HOURS,
   startGame, maybeResolve, buildState, resolveExpiredGames,
 } from './game.js';
 
@@ -126,7 +126,10 @@ async function handleApi(request, env, url) {
   if (head === 'config' && method === 'GET') {
     return json({
       factions: FACTIONS.map((f) => ({ id: f.id, name: f.name, color: f.color })),
-      movePoints: MOVE_POINTS,
+      defaultMoves: START.moves,
+      startSize: START.size,
+      dice: DICE,
+      sizePerBonus: SIZE_PER_BONUS,
       turnHours: TURN_HOURS,
       maxPlayers: MAX_PLAYERS,
       minPlayers: MIN_PLAYERS,
@@ -364,7 +367,7 @@ async function setOrders(request, env, user, game) {
     const cx = Number(target[0]);
     const cy = Number(target[1]);
     if (!inBounds(cx, cy)) return json({ error: 'off_map' }, 400);
-    if (distance(unit.cx, unit.cy, cx, cy) > MOVE_POINTS) return json({ error: 'too_far' }, 400);
+    if (distance(unit.cx, unit.cy, cx, cy) > unit.moves) return json({ error: 'too_far' }, 400);
 
     stmts.push(env.DB.prepare('INSERT INTO orders (game_id, turn, unit_id, cx, cy) VALUES (?,?,?,?,?)')
       .bind(game.id, game.turn, unit.id, cx, cy));

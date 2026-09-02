@@ -4,10 +4,13 @@
 
 const el = (id) => document.getElementById(id);
 
-const HEX = 20;                        // hex "radius" in px
+const HEX = 20;                        // hex "radius" in svg units
 const HW = Math.sqrt(3) * HEX;         // column spacing
 const HH = 1.5 * HEX;                  // row spacing
 const PAD = 6;
+
+const ZOOM_MIN = 0.35;
+const ZOOM_MAX = 3;
 
 let CONFIG = null;
 let ME = null;
@@ -16,6 +19,9 @@ let selected = null;                   // id of the selected troop
 let poll = null;
 let ticker = null;
 let authMode = 'login';
+let homeSignature = null;              // so polling doesn't rebuild an unchanged list
+// 0 means "fit to the panel"; any other value is a fixed scale factor.
+let zoom = Number(localStorage.getItem('hexfront.zoom')) || 0;
 
 // ---------------------------------------------------------------- plumbing
 
@@ -52,9 +58,76 @@ function toCube(cx, cy) {
   return [x, -x - cy, cy];
 }
 
+function toOffset(x, z) {
+  return [x + (z - (z & 1)) / 2, z];
+}
+
 function dist(ax, ay, bx, by) {
   const a = toCube(ax, ay), b = toCube(bx, by);
   return (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2])) / 2;
+}
+
+function cubeRound(x, y, z) {
+  let rx = Math.round(x), ry = Math.round(y), rz = Math.round(z);
+  const dx = Math.abs(rx - x), dy = Math.abs(ry - y), dz = Math.abs(rz - z);
+  if (dx > dy && dx > dz) rx = -ry - rz;
+  else if (dy > dz) ry = -rx - rz;
+  else rz = -rx - ry;
+  return [rx, ry, rz];
+}
+
+function line(ax, ay, bx, by) {
+  const steps = dist(ax, ay, bx, by);
+  const a = toCube(ax, ay), b = toCube(bx, by);
+  const out = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = steps === 0 ? 0 : i / steps;
+    const [rx, , rz] = cubeRound(
+      a[0] + (b[0] - a[0]) * t + 1e-6,
+      a[1] + (b[1] - a[1]) * t + 2e-6,
+      a[2] + (b[2] - a[2]) * t - 3e-6,
+    );
+    out.push(toOffset(rx, rz));
+  }
+  return out;
+}
+
+function inBounds(cx, cy, s) {
+  return cx >= 0 && cx < s.game.mapW && cy >= 0 && cy < s.game.mapH;
+}
+
+const CUBE_DIRS = [[1, -1, 0], [1, 0, -1], [0, 1, -1], [-1, 1, 0], [-1, 0, 1], [0, -1, 1]];
+
+function neighbors(cx, cy) {
+  const [x, , z] = toCube(cx, cy);
+  return CUBE_DIRS.map((d) => toOffset(x + d[0], z + d[2]));
+}
+
+// Mirrors walkPath in src/hex.js so the drawn route is the route the server walks.
+function walkPath(ax, ay, bx, by, s) {
+  if (ax === bx && ay === by) return [];
+  const straight = line(ax, ay, bx, by).slice(1);
+  if (straight.every(([cx, cy]) => inBounds(cx, cy, s))) return straight;
+
+  const from = new Map([[ax + ',' + ay, null]]);
+  let frontier = [[ax, ay]];
+  while (frontier.length) {
+    const next = [];
+    for (const [cx, cy] of frontier) {
+      for (const [nx, ny] of neighbors(cx, cy)) {
+        if (!inBounds(nx, ny, s) || from.has(nx + ',' + ny)) continue;
+        from.set(nx + ',' + ny, [cx, cy]);
+        if (nx === bx && ny === by) {
+          const steps = [];
+          for (let at = [bx, by]; at; at = from.get(at[0] + ',' + at[1])) steps.push(at);
+          return steps.reverse().slice(1);
+        }
+        next.push([nx, ny]);
+      }
+    }
+    frontier = next;
+  }
+  return [];
 }
 
 function center(cx, cy) {
@@ -121,12 +194,18 @@ el('logout').addEventListener('click', async () => {
 
 // ---------------------------------------------------------------- home view
 
+// Polled, so a lobby someone else opens shows up without a refresh. The list is
+// only rebuilt when it actually changed, so it never eats a half-typed name.
 async function renderHome() {
-  show('view-home');
-  const { data } = await api('/games');
-  const list = el('game-list');
+  const { ok, data } = await api('/games');
+  if (!ok || !data.games) return;
 
-  if (!data.games || !data.games.length) {
+  const signature = JSON.stringify(data.games);
+  if (signature === homeSignature) return;
+  homeSignature = signature;
+
+  const list = el('game-list');
+  if (!data.games.length) {
     list.innerHTML = '<p class="muted small">No games yet. Create the first one.</p>';
     return;
   }
@@ -211,9 +290,9 @@ function renderLobby(s) {
 el('faction-grid').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-faction]');
   if (!btn || !STATE) return;
-  const faction = Number(btn.dataset.faction);
+  const picked = Number(btn.dataset.faction);
   const path = '/games/' + STATE.game.id + (STATE.you ? '/faction' : '/join');
-  const { ok, data } = await api(path, 'POST', { faction });
+  const { ok, data } = await api(path, 'POST', { faction: picked });
   if (!ok) alert(data.message || data.error);
   refreshGame();
 });
@@ -251,14 +330,17 @@ function renderGame(s) {
     ? 'You are watching this game.'
     : you.submitted
       ? (waiting.length ? 'Waiting on: ' + waiting.join(', ') : 'Resolving...')
-      : 'Move your troop, then submit. Orders resolve once everyone submits.';
+      : 'Move your armies, then submit. Orders resolve once everyone submits.';
 
   el('game-players').innerHTML = s.players.map((p) => {
     const f = faction(p.faction);
+    const armies = s.units.filter((u) => u.faction === p.faction && u.kind === 'troop');
+    const strength = armies.reduce((n, u) => n + u.size, 0);
     return '<div class="list-row">' +
       '<span class="swatch" style="background:' + f.color + '"></span>' +
       '<strong>' + esc(p.username) + '</strong>' +
       (p.isYou ? '<span class="tag">you</span>' : '') +
+      (p.isYou ? '<span class="muted small">' + strength + ' str</span>' : '') +
       '<span class="spacer"></span>' +
       '<span class="tag ' + (p.submitted ? 'ok' : 'wait') + '">' + (p.submitted ? 'in' : 'thinking') + '</span></div>';
   }).join('');
@@ -280,11 +362,62 @@ function renderDeadline() {
   el('deadline').textContent = 'auto-resolves in ' + parts;
 }
 
+// ---------------------------------------------------------------- zoom
+
+function baseWidth(s) {
+  return HW * ((s ? s.game.mapW : 24) + 0.5) + PAD * 2;
+}
+
+function clampZoom(z) {
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+}
+
+// Recomputed every time rather than cached, so "fit" survives a window resize
+// and a first paint that happens before the board has been laid out.
+function fitZoom(base) {
+  const box = el('map-scroll').clientWidth;
+  return box ? clampZoom(box / base) : 1;
+}
+
+function currentZoom() {
+  return zoom || fitZoom(baseWidth(STATE));
+}
+
+function applyZoom() {
+  const svg = document.querySelector('#map svg');
+  if (!svg) return;
+  const base = baseWidth(STATE);
+  const z = zoom || fitZoom(base);
+  svg.style.width = Math.round(base * z) + 'px';
+  el('zoom-level').textContent = Math.round(z * 100) + '%';
+}
+
+function setZoom(next) {
+  zoom = clampZoom(next);
+  localStorage.setItem('hexfront.zoom', String(zoom));
+  applyZoom();
+}
+
+el('zoom-in').addEventListener('click', () => setZoom(currentZoom() * 1.25));
+el('zoom-out').addEventListener('click', () => setZoom(currentZoom() / 1.25));
+el('zoom-fit').addEventListener('click', () => {
+  zoom = 0;
+  localStorage.setItem('hexfront.zoom', 'fit');
+  applyZoom();
+});
+window.addEventListener('resize', () => { if (!zoom) applyZoom(); });
+
+// Ctrl/cmd + wheel zooms; a plain wheel still scrolls the board.
+el('map-scroll').addEventListener('wheel', (e) => {
+  if (!e.ctrlKey && !e.metaKey) return;
+  e.preventDefault();
+  setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12));
+}, { passive: false });
+
+// ---------------------------------------------------------------- map
+
 function renderMap(s) {
   const visible = new Set(s.visible);
-  const unitAt = new Map();
-  for (const u of s.units) unitAt.set(u.cx + ',' + u.cy, u);
-
   const sel = s.units.find((u) => u.id === selected && u.mine && u.kind === 'troop') || null;
   if (!sel) selected = null;
 
@@ -292,12 +425,12 @@ function renderMap(s) {
   if (sel && s.you && !s.you.submitted) {
     for (let cy = 0; cy < s.game.mapH; cy++) {
       for (let cx = 0; cx < s.game.mapW; cx++) {
-        if (dist(sel.cx, sel.cy, cx, cy) <= s.game.movePoints) reach.add(cx + ',' + cy);
+        if (dist(sel.cx, sel.cy, cx, cy) <= sel.moves) reach.add(cx + ',' + cy);
       }
     }
   }
 
-  const w = HW * (s.game.mapW + 0.5) + PAD * 2;
+  const w = baseWidth(s);
   const h = HH * (s.game.mapH - 1) + HEX * 2 + PAD * 2;
   const out = ['<svg viewBox="0 0 ' + w.toFixed(0) + ' ' + h.toFixed(0) + '" xmlns="http://www.w3.org/2000/svg">'];
 
@@ -313,14 +446,17 @@ function renderMap(s) {
     }
   }
 
-  // 2. ordered moves
+  // 2. ordered moves, drawn along the hexes the army actually walks through
   for (const [unitId, target] of Object.entries(s.orders || {})) {
     const u = s.units.find((n) => String(n.id) === String(unitId));
     if (!u) continue;
-    const [x1, y1] = center(u.cx, u.cy);
-    const [x2, y2] = center(target[0], target[1]);
-    out.push('<line class="order-line" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '"></line>');
-    out.push('<circle class="order-dot" cx="' + x2 + '" cy="' + y2 + '" r="8"></circle>');
+    const steps = walkPath(u.cx, u.cy, target[0], target[1], s);
+    if (!steps.length) continue;
+    const pts = [[u.cx, u.cy], ...steps]
+      .map(([cx, cy]) => center(cx, cy).map((n) => n.toFixed(1)).join(',')).join(' ');
+    const [tx, ty] = center(...steps[steps.length - 1]);
+    out.push('<polyline class="order-line" points="' + pts + '" fill="none"></polyline>');
+    out.push('<circle class="order-dot" cx="' + tx + '" cy="' + ty + '" r="8"></circle>');
   }
 
   // 3. counters
@@ -331,22 +467,24 @@ function renderMap(s) {
       out.push('<g class="unit"><circle class="unit-city" cx="' + x + '" cy="' + y + '" r="11" fill="' + f.color + '"></circle>' +
         '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="none" stroke="#0b0e13" stroke-width="2"></circle></g>');
     } else {
-      out.push('<g class="unit"><rect class="unit-troop" x="' + (x - 10) + '" y="' + (y - 8) + '" width="20" height="16" rx="2" fill="' + f.color + '"></rect>' +
-        '<path d="M' + (x - 10) + ' ' + (y - 8) + ' L' + (x + 10) + ' ' + (y + 8) +
-        ' M' + (x + 10) + ' ' + (y - 8) + ' L' + (x - 10) + ' ' + (y + 8) + '" stroke="#0b0e13" stroke-width="1.5" fill="none"></path></g>');
+      out.push('<g class="unit">' +
+        '<rect class="unit-troop" x="' + (x - 11) + '" y="' + (y - 9) + '" width="22" height="18" rx="2" fill="' + f.color + '"></rect>' +
+        '<text class="unit-size" x="' + x + '" y="' + (y + 4.5) + '">' + u.size + '</text></g>');
     }
   }
 
   out.push('</svg>');
   el('map').innerHTML = out.join('');
+  applyZoom();
 
   el('map-hint').textContent = !s.you
-    ? 'Spectating - you have no units here.'
+    ? 'Spectating - you have no armies here.'
     : s.you.submitted
       ? 'Orders are locked in. Un-submit if you want to change them.'
       : sel
-        ? 'Click a highlighted hex to move there, or click your troop again to deselect.'
-        : 'Click your troop (the square counter) to give it orders. Range: ' + s.game.movePoints + ' hexes.';
+        ? 'Selected army: size ' + sel.size + ', moves ' + sel.moves + ', damage ' + sel.damage +
+          '. Click a highlighted hex to march there.'
+        : 'Click one of your armies (the numbered counters) to give it orders. Ctrl+scroll to zoom.';
 }
 
 el('map').addEventListener('click', async (e) => {
@@ -364,11 +502,13 @@ el('map').addEventListener('click', async (e) => {
 
   const unit = STATE.units.find((u) => u.id === selected);
   if (!unit || STATE.you.submitted) return;
-  if (dist(unit.cx, unit.cy, cx, cy) > STATE.game.movePoints) { selected = null; renderMap(STATE); return; }
+  if (dist(unit.cx, unit.cy, cx, cy) > unit.moves) { selected = null; renderMap(STATE); return; }
 
-  // Optimistic: draw the order now, then persist it.
+  // Optimistic: draw the order and drop the selection, then persist it.
   STATE.orders[unit.id] = [cx, cy];
+  selected = null;
   renderMap(STATE);
+
   const { ok, data } = await api('/games/' + STATE.game.id + '/orders', 'POST',
     { orders: { [unit.id]: [cx, cy] } });
   if (!ok) alert(data.message || data.error);
@@ -416,7 +556,14 @@ async function route() {
   el('whoami').textContent = ME.username;
 
   const id = gameIdFromHash();
-  if (id === null) { STATE = null; renderHome(); return; }
+  if (id === null) {
+    STATE = null;
+    homeSignature = null;
+    show('view-home');
+    await renderHome();
+    poll = setInterval(renderHome, 5000);
+    return;
+  }
 
   await refreshGame();
   poll = setInterval(refreshGame, 5000);
