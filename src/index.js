@@ -3,7 +3,7 @@
 // Anything matching a file in ./public is served by the assets binding before
 // the Worker runs, so only /api/* (and unknown paths) reach this code.
 
-import { inBounds, distance } from './hex.js';
+import { inBounds, walkPath, TERRAIN } from './hex.js';
 import {
   FACTIONS, MAX_PLAYERS, MIN_PLAYERS, START, DICE, SIZE_PER_BONUS, TURN_HOURS,
   startGame, maybeResolve, buildState, resolveExpiredGames,
@@ -133,6 +133,7 @@ async function handleApi(request, env, url) {
       turnHours: TURN_HOURS,
       maxPlayers: MAX_PLAYERS,
       minPlayers: MIN_PLAYERS,
+      terrain: TERRAIN,
       signupCodeRequired: !!env.SIGNUP_CODE,
     });
   }
@@ -160,10 +161,11 @@ async function handleApi(request, env, url) {
 
     const action = parts[2];
     if (action === 'state' && method === 'GET') {
+      const viewAs = url.searchParams.get('as');
       if (await maybeResolve(env, game)) {
-        return json(await buildState(env, await refresh(env, gameId), user.id));
+        return json(await buildState(env, await refresh(env, gameId), user.id, viewAs));
       }
-      return json(await buildState(env, game, user.id));
+      return json(await buildState(env, game, user.id, viewAs));
     }
     if (action === 'join' && method === 'POST') return joinGame(request, env, user, game);
     if (action === 'faction' && method === 'POST') return pickFaction(request, env, user, game);
@@ -259,15 +261,24 @@ async function listGames(env, user) {
 }
 
 async function createGame(request, env, user) {
-  const { name } = await readJson(request);
-  const title = String(name || '').trim().slice(0, 40) || `${user.username}'s game`;
+  const { name, solo } = await readJson(request);
+  const title = String(name || '').trim().slice(0, 40) ||
+    user.username + (solo ? "'s test game" : "'s game");
+
   const result = await env.DB.prepare(
-    "INSERT INTO games (name, status, turn, host_id, created_at) VALUES (?, 'lobby', 0, ?, ?)"
-  ).bind(title, user.id, Date.now()).run();
+    "INSERT INTO games (name, status, turn, host_id, created_at, solo) VALUES (?, 'lobby', 0, ?, ?, ?)"
+  ).bind(title, user.id, Date.now(), solo ? 1 : 0).run();
   const gameId = result.meta.last_row_id;
+
   await env.DB.prepare('INSERT INTO players (game_id, user_id, faction) VALUES (?,?,?)')
     .bind(gameId, user.id, 0).run();
-  return json({ id: gameId });
+
+  // A test game skips the lobby: one person drives all six factions at once.
+  if (solo) {
+    const fresh = await refresh(env, gameId);
+    await startGame(env, fresh, FACTIONS.map((f) => f.id));
+  }
+  return json({ id: gameId, solo: !!solo });
 }
 
 async function joinGame(request, env, user, game) {
@@ -320,7 +331,9 @@ async function setReady(request, env, user, game) {
 
   let started = false;
   if (counts.total >= MIN_PLAYERS && counts.done === counts.total) {
-    started = await startGame(env, game);
+    const seated = (await env.DB.prepare('SELECT faction FROM players WHERE game_id=?')
+      .bind(game.id).all()).results.map((p) => p.faction);
+    started = await startGame(env, game, seated);
   }
   return json({ ok: true, started });
 }
@@ -350,9 +363,12 @@ async function setOrders(request, env, user, game) {
   const { orders } = await readJson(request);
   if (!orders || typeof orders !== 'object') return json({ error: 'bad_orders' }, 400);
 
-  const troops = (await env.DB.prepare(
-    "SELECT * FROM units WHERE game_id=? AND faction=? AND kind='troop'"
-  ).bind(game.id, player.faction).all()).results;
+  // In a solo test game the one player commands every faction.
+  const troops = game.solo
+    ? (await env.DB.prepare("SELECT * FROM units WHERE game_id=? AND kind='troop'")
+        .bind(game.id).all()).results
+    : (await env.DB.prepare("SELECT * FROM units WHERE game_id=? AND faction=? AND kind='troop'")
+        .bind(game.id, player.faction).all()).results;
   const byId = new Map(troops.map((t) => [String(t.id), t]));
 
   const stmts = [];
@@ -367,7 +383,10 @@ async function setOrders(request, env, user, game) {
     const cx = Number(target[0]);
     const cy = Number(target[1]);
     if (!inBounds(cx, cy)) return json({ error: 'off_map' }, 400);
-    if (distance(unit.cx, unit.cy, cx, cy) > unit.moves) return json({ error: 'too_far' }, 400);
+    // Terrain decides reach: no route within the army's movement means no order.
+    if (!walkPath(game.terrain, unit.cx, unit.cy, cx, cy, unit.moves).length) {
+      return json({ error: 'unreachable', message: 'That army cannot reach there this turn.' }, 400);
+    }
 
     stmts.push(env.DB.prepare('INSERT INTO orders (game_id, turn, unit_id, cx, cy) VALUES (?,?,?,?,?)')
       .bind(game.id, game.turn, unit.id, cx, cy));

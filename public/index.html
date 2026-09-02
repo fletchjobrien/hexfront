@@ -58,6 +58,10 @@
       <input id="create-name" placeholder="Game name" maxlength="40">
       <button class="primary" type="submit">Create lobby</button>
     </form>
+    <label class="check">
+      <input type="checkbox" id="create-solo">
+      Test game — skip the lobby and command all six factions yourself
+    </label>
   </section>
 
   <section class="card">
@@ -96,8 +100,14 @@
       <span id="zoom-level" class="muted small">100%</span>
       <button id="zoom-in" class="ghost" title="Zoom in">+</button>
       <button id="zoom-fit" class="ghost">Fit</button>
+      <select id="view-as" hidden></select>
       <span class="spacer"></span>
-      <span class="muted small">Ctrl+scroll to zoom</span>
+      <span class="legend">
+        <i style="background:#33503a"></i>Flat 1
+        <i style="background:#6b5a37"></i>Hills 2
+        <i style="background:#1d3f66"></i>Water
+        <i style="background:#575761"></i>Mountains
+      </span>
     </div>
     <div id="map-scroll">
       <div id="map"></div>

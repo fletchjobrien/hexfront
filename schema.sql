@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS games (
   turn        INTEGER NOT NULL DEFAULT 0,
   deadline_at INTEGER,
   host_id     INTEGER NOT NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  terrain     TEXT,
+  solo        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS players (

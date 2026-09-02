@@ -4,9 +4,9 @@ A simultaneous-turn hex strategy game for a group of friends — Twilight Imperi
 scheming and Diplomacy's "everyone writes orders in secret, then they all resolve
 at once", on a hex-and-counter map.
 
-One 24×24 map, six factions, a city and an army each, fog of war, dice combat,
-and a turn that resolves when everyone has submitted - or after 48 hours,
-whichever comes first.
+A randomly generated 24×24 map, six factions, a city and an army each, fog of
+war, terrain, dice combat, and a turn that resolves when everyone has submitted -
+or after 48 hours, whichever comes first.
 
 Runs as a single Cloudflare Worker: static frontend + JSON API, with game state
 in D1 (Cloudflare's SQLite). No build step, no framework, no npm install needed
@@ -83,28 +83,44 @@ npx wrangler dev
 
 | | |
 |---|---|
-| Map | 24×24 hexes, no terrain yet |
+| Map | 24×24 hexes, randomly generated per game |
+| Terrain | **Flat** costs 1, **hills** cost 2, **water** and **mountains** are impassable |
 | Units | 1 city (never moves) and 1 army per faction |
 | Army stats | **size** 10, **movement** 2, **damage** 3 |
 | Sight | 4 hexes from a city, 3 from an army |
 | Enemy city | Can't be entered — a march stops in front of it |
 | Turn length | 48 hours, or as soon as everyone submits |
 
+With 2 movement an army crosses two flat hexes, or one hill. Terrain is public —
+everyone sees the whole map; the fog hides armies, not geography.
+
+Each map is generated fresh: smoothed noise cut at fixed quantiles, so the mix
+of land and water stays roughly constant. Every faction gets open ground around
+its city, and the generator guarantees all six starts can reach each other on
+foot — otherwise a game could be decided by an unlucky mountain range.
+
 ### How a turn resolves
 
 Every army moves **one hex at a time, in lockstep**. After each step the server
-looks for two things:
+looks for three things:
 
-- two factions ending up on the same hex, and
-- two armies trying to trade places.
+- two factions ending up on the same hex,
+- two armies trying to trade places, and
+- an army **moving into contact** — finishing a step next to an enemy.
 
-Either one is a fight, which is what stops armies sliding through each other —
-there is no swapping.
+Any of them is a fight. The first two mean there is no swapping and no walking
+through each other; the third means a march stops dead the moment it runs into
+somebody, so you cannot slip past an enemy army that is standing in your way.
+
+Armies that were *already* next to each other and both stay put do not fight —
+contact has to be made by somebody moving. That also means you can disengage, as
+long as you end your move somewhere that isn't still adjacent.
 
 **The fight.** Each side rolls a d6 and adds a bonus of `size ÷ 3`, rounded
 down. So a size-10 army adds +3. Highest total wins:
 
-- the **winner** keeps going wherever it was headed;
+- everyone involved is **finished moving for the turn**, winner included;
+- the **winner** takes the hex that was being fought over, if there was one;
 - each **loser** takes damage equal to the winner's `damage` and retreats one
   hex, as far from the winner as it can get. An army with nowhere to fall back
   to is pinned and takes the damage where it stands;
@@ -132,7 +148,8 @@ wrangler.jsonc     Worker config: D1 binding, static assets, cron trigger
 schema.sql         Database tables
 src/index.js       HTTP layer: accounts, sessions, lobby and order endpoints
 src/game.js        Rules: setup, fog of war, simultaneous movement and combat
-src/hex.js         Odd-r offset hex coordinates, distance and routing
+src/hex.js         Hex coordinates, terrain costs and routing
+src/terrain.js     Random map generation
 public/index.html  Landing page, lobby and game shell
 public/app.js      Client: SVG map, order entry, polling
 public/style.css   Styling
@@ -143,16 +160,31 @@ it can highlight legal moves and draw the route an army will walk. They must
 stay in step with `src/hex.js` — the server recomputes everything anyway, so a
 mismatch shows up as a drawn route that doesn't match what actually happened.
 
-### Upgrading a database made before armies had stats
+### Test games
 
-The `units` table gained `size`, `moves` and `damage`. If your D1 database
-predates that, run this once in the D1 console rather than recreating it:
+Tick **"Test game"** when creating a game and it skips the lobby entirely: you
+get a map with all six factions on it and you command every one of them. The
+dropdown above the board switches between *All factions (no fog)* and looking
+through any single faction's eyes, which is the only practical way to check that
+the fog behaves. Submitting resolves the turn immediately, since you are the
+only player.
+
+### Upgrading an existing database
+
+Each release so far has added columns. If your D1 database predates them, run
+whichever of these it is missing, in the D1 console:
 
 ```sql
 ALTER TABLE units ADD COLUMN size INTEGER NOT NULL DEFAULT 10;
 ALTER TABLE units ADD COLUMN moves INTEGER NOT NULL DEFAULT 2;
 ALTER TABLE units ADD COLUMN damage INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE games ADD COLUMN terrain TEXT;
+ALTER TABLE games ADD COLUMN solo INTEGER NOT NULL DEFAULT 0;
 ```
+
+SQLite has no `ADD COLUMN IF NOT EXISTS`, so a column you already have will
+error — that error is harmless, just run the rest. Games created before terrain
+existed have none, and every hex in them behaves as flat.
 
 The D1 console rejects input it can't parse into a statement, and `--` comment
 lines are the usual cause — strip them before pasting:
@@ -171,10 +203,6 @@ Roughly in order of "most game for the least code":
   city besiege and capture it, and add a victory condition.
 - **Reinforcements.** Cities produce a new army, or add size to a nearby one,
   every few turns - otherwise attrition just ends the game.
-- **Terrain.** Add a terrain column to the map and make movement cost vary.
-  `walkPath` in `src/hex.js` is already the single place routing happens, so
-  terrain only has to be taught there. This is where real hex-and-counter feel
-  comes from.
 - **Diplomacy.** Private messages between players, and formal alliances whose
   armies share a hex instead of fighting over it.
 - **Notifications.** Email or Discord webhook when a turn resolves or a deadline

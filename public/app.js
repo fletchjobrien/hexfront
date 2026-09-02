@@ -12,14 +12,24 @@ const PAD = 6;
 const ZOOM_MIN = 0.35;
 const ZOOM_MAX = 3;
 
+const TERRAIN_FILL = {
+  f: { seen: '#33503a', fog: '#18241b' },   // flat
+  h: { seen: '#6b5a37', fog: '#2c2619' },   // hills
+  w: { seen: '#1d3f66', fog: '#0f1f31' },   // water
+  m: { seen: '#575761', fog: '#26262c' },   // mountains
+};
+
 let CONFIG = null;
 let ME = null;
 let STATE = null;
-let selected = null;                   // id of the selected troop
+let selected = null;                   // id of the selected army
 let poll = null;
 let ticker = null;
 let authMode = 'login';
 let homeSignature = null;              // so polling doesn't rebuild an unchanged list
+let viewAs = 'all';                    // solo test games only
+let suppressClick = false;             // set while dragging, so a pan isn't a click
+
 // 0 means "fit to the panel"; any other value is a fixed scale factor.
 let zoom = Number(localStorage.getItem('hexfront.zoom')) || 0;
 
@@ -51,7 +61,7 @@ function faction(id) {
 }
 
 // ---------------------------------------------------------------- hex maths
-// Mirrors src/hex.js on the server: odd-r offset coordinates.
+// Mirrors src/hex.js: odd-r offset coordinates and terrain-aware routing.
 
 function toCube(cx, cy) {
   const x = cx - (cy - (cy & 1)) / 2;
@@ -65,6 +75,13 @@ function toOffset(x, z) {
 function dist(ax, ay, bx, by) {
   const a = toCube(ax, ay), b = toCube(bx, by);
   return (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2])) / 2;
+}
+
+const CUBE_DIRS = [[1, -1, 0], [1, 0, -1], [0, 1, -1], [-1, 1, 0], [-1, 0, 1], [0, -1, 1]];
+
+function neighbors(cx, cy) {
+  const [x, , z] = toCube(cx, cy);
+  return CUBE_DIRS.map((d) => toOffset(x + d[0], z + d[2]));
 }
 
 function cubeRound(x, y, z) {
@@ -96,38 +113,68 @@ function inBounds(cx, cy, s) {
   return cx >= 0 && cx < s.game.mapW && cy >= 0 && cy < s.game.mapH;
 }
 
-const CUBE_DIRS = [[1, -1, 0], [1, 0, -1], [0, 1, -1], [-1, 1, 0], [-1, 0, 1], [0, -1, 1]];
-
-function neighbors(cx, cy) {
-  const [x, , z] = toCube(cx, cy);
-  return CUBE_DIRS.map((d) => toOffset(x + d[0], z + d[2]));
+function terrainAt(s, cx, cy) {
+  const t = s.game.terrain;
+  if (!t) return 'f';
+  return t[cy * s.game.mapW + cx] || 'f';
 }
 
-// Mirrors walkPath in src/hex.js so the drawn route is the route the server walks.
-function walkPath(ax, ay, bx, by, s) {
-  if (ax === bx && ay === by) return [];
-  const straight = line(ax, ay, bx, by).slice(1);
-  if (straight.every(([cx, cy]) => inBounds(cx, cy, s))) return straight;
+function moveCost(s, cx, cy) {
+  const def = CONFIG.terrain[terrainAt(s, cx, cy)];
+  return def ? def.cost : 1;
+}
 
-  const from = new Map([[ax + ',' + ay, null]]);
-  let frontier = [[ax, ay]];
-  while (frontier.length) {
-    const next = [];
-    for (const [cx, cy] of frontier) {
+function passable(s, cx, cy) {
+  return inBounds(cx, cy, s) && moveCost(s, cx, cy) !== null;
+}
+
+function reachable(s, ax, ay, budget) {
+  const best = new Map([[ax + ',' + ay, { cost: 0, prev: null }]]);
+  const buckets = [[[ax, ay]]];
+
+  for (let cost = 0; cost <= budget; cost++) {
+    const bucket = buckets[cost];
+    if (!bucket) continue;
+    for (const [cx, cy] of bucket) {
+      const here = best.get(cx + ',' + cy);
+      if (!here || here.cost !== cost) continue;
       for (const [nx, ny] of neighbors(cx, cy)) {
-        if (!inBounds(nx, ny, s) || from.has(nx + ',' + ny)) continue;
-        from.set(nx + ',' + ny, [cx, cy]);
-        if (nx === bx && ny === by) {
-          const steps = [];
-          for (let at = [bx, by]; at; at = from.get(at[0] + ',' + at[1])) steps.push(at);
-          return steps.reverse().slice(1);
-        }
-        next.push([nx, ny]);
+        if (!passable(s, nx, ny)) continue;
+        const next = cost + moveCost(s, nx, ny);
+        if (next > budget) continue;
+        const k = nx + ',' + ny;
+        const seen = best.get(k);
+        if (seen && seen.cost <= next) continue;
+        best.set(k, { cost: next, prev: [cx, cy] });
+        (buckets[next] || (buckets[next] = [])).push([nx, ny]);
       }
     }
-    frontier = next;
   }
-  return [];
+  return best;
+}
+
+function walkPath(s, ax, ay, bx, by, budget) {
+  if (ax === bx && ay === by) return [];
+  if (!passable(s, bx, by)) return [];
+
+  const straight = line(ax, ay, bx, by).slice(1);
+  if (straight.length && straight.every(([cx, cy]) => passable(s, cx, cy))) {
+    const cost = straight.reduce((n, [cx, cy]) => n + moveCost(s, cx, cy), 0);
+    if (cost <= budget) return straight;
+  }
+
+  const best = reachable(s, ax, ay, budget);
+  if (!best.has(bx + ',' + by)) return [];
+
+  const steps = [];
+  let at = [bx, by];
+  for (;;) {
+    const node = best.get(at[0] + ',' + at[1]);
+    if (!node || !node.prev) break;
+    steps.push(at);
+    at = node.prev;
+  }
+  return steps.reverse();
 }
 
 function center(cx, cy) {
@@ -219,6 +266,7 @@ async function renderHome() {
           : '<button data-open="' + g.id + '">Watch</button>');
     return '<div class="list-row">' +
       '<strong>' + esc(g.name) + '</strong>' +
+      (g.solo ? '<span class="tag">test</span>' : '') +
       '<span class="tag">' + where + '</span>' +
       '<span class="muted small">' + g.players + '/' + CONFIG.maxPlayers + ' players</span>' +
       '<span class="spacer"></span>' + action + '</div>';
@@ -238,8 +286,14 @@ el('game-list').addEventListener('click', async (e) => {
 
 el('create-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const { ok, data } = await api('/games', 'POST', { name: el('create-name').value });
-  if (ok) { el('create-name').value = ''; location.hash = '#/g/' + data.id; }
+  const solo = el('create-solo').checked;
+  const { ok, data } = await api('/games', 'POST', { name: el('create-name').value, solo });
+  if (ok) {
+    el('create-name').value = '';
+    el('create-solo').checked = false;
+    viewAs = 'all';
+    location.hash = '#/g/' + data.id;
+  }
 });
 
 // ---------------------------------------------------------------- lobby view
@@ -316,6 +370,7 @@ function renderGame(s) {
   el('game-name').textContent = s.game.name;
   el('turn-no').textContent = 'Turn ' + s.game.turn;
   renderDeadline();
+  renderSeatPicker(s);
 
   const you = s.you;
   const btn = el('submit-btn');
@@ -328,19 +383,22 @@ function renderGame(s) {
   const waiting = s.players.filter((p) => !p.submitted).map((p) => p.username);
   el('submit-hint').textContent = !you
     ? 'You are watching this game.'
-    : you.submitted
-      ? (waiting.length ? 'Waiting on: ' + waiting.join(', ') : 'Resolving...')
-      : 'Move your armies, then submit. Orders resolve once everyone submits.';
+    : s.game.solo
+      ? 'Test game - you command every faction. Submitting resolves the turn.'
+      : you.submitted
+        ? (waiting.length ? 'Waiting on: ' + waiting.join(', ') : 'Resolving...')
+        : 'Move your armies, then submit. Orders resolve once everyone submits.';
 
   el('game-players').innerHTML = s.players.map((p) => {
     const f = faction(p.faction);
     const armies = s.units.filter((u) => u.faction === p.faction && u.kind === 'troop');
     const strength = armies.reduce((n, u) => n + u.size, 0);
+    const showStrength = p.isYou || s.game.solo;
     return '<div class="list-row">' +
       '<span class="swatch" style="background:' + f.color + '"></span>' +
       '<strong>' + esc(p.username) + '</strong>' +
-      (p.isYou ? '<span class="tag">you</span>' : '') +
-      (p.isYou ? '<span class="muted small">' + strength + ' str</span>' : '') +
+      (p.isYou && !s.game.solo ? '<span class="tag">you</span>' : '') +
+      (showStrength ? '<span class="muted small">' + strength + ' str</span>' : '') +
       '<span class="spacer"></span>' +
       '<span class="tag ' + (p.submitted ? 'ok' : 'wait') + '">' + (p.submitted ? 'in' : 'thinking') + '</span></div>';
   }).join('');
@@ -352,6 +410,29 @@ function renderGame(s) {
   renderMap(s);
 }
 
+function renderSeatPicker(s) {
+  const picker = el('view-as');
+  picker.hidden = !s.game.solo;
+  if (!s.game.solo) return;
+
+  const wanted = String(s.game.viewAs);
+  const options = ['<option value="all">All factions (no fog)</option>'].concat(
+    (s.game.factionsInPlay || []).map((f) =>
+      '<option value="' + f + '">See as ' + esc(faction(f).name) + '</option>'));
+  const markup = options.join('');
+  if (picker.dataset.built !== markup) {
+    picker.innerHTML = markup;
+    picker.dataset.built = markup;
+  }
+  picker.value = wanted;
+}
+
+el('view-as').addEventListener('change', (e) => {
+  viewAs = e.target.value;
+  selected = null;
+  refreshGame();
+});
+
 function renderDeadline() {
   if (!STATE || !STATE.game.deadlineAt) { el('deadline').textContent = ''; return; }
   const ms = STATE.game.deadlineAt - Date.now();
@@ -362,7 +443,7 @@ function renderDeadline() {
   el('deadline').textContent = 'auto-resolves in ' + parts;
 }
 
-// ---------------------------------------------------------------- zoom
+// ---------------------------------------------------------------- zoom and pan
 
 function baseWidth(s) {
   return HW * ((s ? s.game.mapW : 24) + 0.5) + PAD * 2;
@@ -411,8 +492,43 @@ window.addEventListener('resize', () => { if (!zoom) applyZoom(); });
 el('map-scroll').addEventListener('wheel', (e) => {
   if (!e.ctrlKey && !e.metaKey) return;
   e.preventDefault();
-  setZoom(zoom * (e.deltaY < 0 ? 1.12 : 1 / 1.12));
+  setZoom(currentZoom() * (e.deltaY < 0 ? 1.12 : 1 / 1.12));
 }, { passive: false });
+
+// Drag to pan. Only for the mouse - touch already scrolls the panel natively.
+// A drag that actually moved swallows the click, so panning never gives orders.
+(function enablePan() {
+  const scroller = el('map-scroll');
+  let pan = null;
+
+  // Any fresh press clears the flag, so a swallowed click can never linger.
+  scroller.addEventListener('mousedown', () => { suppressClick = false; });
+
+  scroller.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'mouse' || e.button !== 0) return;
+    suppressClick = false;
+    pan = { x: e.clientX, y: e.clientY, left: scroller.scrollLeft, top: scroller.scrollTop, moved: false };
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!pan) return;
+    const dx = e.clientX - pan.x;
+    const dy = e.clientY - pan.y;
+    if (!pan.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+    pan.moved = true;
+    scroller.classList.add('grabbing');
+    scroller.scrollLeft = pan.left - dx;
+    scroller.scrollTop = pan.top - dy;
+    e.preventDefault();
+  });
+
+  window.addEventListener('pointerup', () => {
+    if (!pan) return;
+    suppressClick = pan.moved;
+    pan = null;
+    scroller.classList.remove('grabbing');
+  });
+})();
 
 // ---------------------------------------------------------------- map
 
@@ -421,45 +537,54 @@ function renderMap(s) {
   const sel = s.units.find((u) => u.id === selected && u.mine && u.kind === 'troop') || null;
   if (!sel) selected = null;
 
-  const reach = new Set();
+  let reach = null;
   if (sel && s.you && !s.you.submitted) {
-    for (let cy = 0; cy < s.game.mapH; cy++) {
-      for (let cx = 0; cx < s.game.mapW; cx++) {
-        if (dist(sel.cx, sel.cy, cx, cy) <= sel.moves) reach.add(cx + ',' + cy);
-      }
-    }
+    reach = reachable(s, sel.cx, sel.cy, sel.moves);
+    reach.delete(sel.cx + ',' + sel.cy);
   }
 
   const w = baseWidth(s);
   const h = HH * (s.game.mapH - 1) + HEX * 2 + PAD * 2;
   const out = ['<svg viewBox="0 0 ' + w.toFixed(0) + ' ' + h.toFixed(0) + '" xmlns="http://www.w3.org/2000/svg">'];
 
-  // 1. terrain
+  // 1. terrain - the click targets
   for (let cy = 0; cy < s.game.mapH; cy++) {
     for (let cx = 0; cx < s.game.mapW; cx++) {
-      const k = cx + ',' + cy;
       const [x, y] = center(cx, cy);
-      let cls = 'hex ' + (visible.has(k) ? 'seen' : 'fog');
-      if (reach.has(k)) cls = 'hex reach';
-      if (sel && sel.cx === cx && sel.cy === cy) cls += ' sel';
-      out.push('<polygon class="' + cls + '" points="' + hexPath(x, y) + '" data-cx="' + cx + '" data-cy="' + cy + '"></polygon>');
+      const seen = visible.has(cx + ',' + cy);
+      const fill = (TERRAIN_FILL[terrainAt(s, cx, cy)] || TERRAIN_FILL.f)[seen ? 'seen' : 'fog'];
+      out.push('<polygon class="hex" fill="' + fill + '" points="' + hexPath(x, y) +
+        '" data-cx="' + cx + '" data-cy="' + cy + '"></polygon>');
     }
   }
 
-  // 2. ordered moves, drawn along the hexes the army actually walks through
+  // 2. where the selected army could go
+  if (reach) {
+    for (const spot of reach.keys()) {
+      const [cx, cy] = spot.split(',').map(Number);
+      const [x, y] = center(cx, cy);
+      out.push('<polygon class="overlay reach" points="' + hexPath(x, y) + '"></polygon>');
+    }
+  }
+  if (sel) {
+    const [x, y] = center(sel.cx, sel.cy);
+    out.push('<polygon class="overlay sel" points="' + hexPath(x, y) + '"></polygon>');
+  }
+
+  // 3. ordered marches, drawn along the hexes the army actually walks
   for (const [unitId, target] of Object.entries(s.orders || {})) {
     const u = s.units.find((n) => String(n.id) === String(unitId));
     if (!u) continue;
-    const steps = walkPath(u.cx, u.cy, target[0], target[1], s);
+    const steps = walkPath(s, u.cx, u.cy, target[0], target[1], u.moves);
     if (!steps.length) continue;
     const pts = [[u.cx, u.cy], ...steps]
       .map(([cx, cy]) => center(cx, cy).map((n) => n.toFixed(1)).join(',')).join(' ');
-    const [tx, ty] = center(...steps[steps.length - 1]);
+    const [tx, ty] = center(steps[steps.length - 1][0], steps[steps.length - 1][1]);
     out.push('<polyline class="order-line" points="' + pts + '" fill="none"></polyline>');
     out.push('<circle class="order-dot" cx="' + tx + '" cy="' + ty + '" r="8"></circle>');
   }
 
-  // 3. counters
+  // 4. counters
   for (const u of s.units) {
     const f = faction(u.faction);
     const [x, y] = center(u.cx, u.cy);
@@ -483,11 +608,12 @@ function renderMap(s) {
       ? 'Orders are locked in. Un-submit if you want to change them.'
       : sel
         ? 'Selected army: size ' + sel.size + ', moves ' + sel.moves + ', damage ' + sel.damage +
-          '. Click a highlighted hex to march there.'
-        : 'Click one of your armies (the numbered counters) to give it orders. Ctrl+scroll to zoom.';
+          '. Hills cost 2; water and mountains are impassable.'
+        : 'Click an army to give it orders. Drag to pan, ctrl+scroll to zoom.';
 }
 
 el('map').addEventListener('click', async (e) => {
+  if (suppressClick) { suppressClick = false; return; }
   const hex = e.target.closest('polygon[data-cx]');
   if (!hex || !STATE || !STATE.you) return;
   const cx = Number(hex.dataset.cx), cy = Number(hex.dataset.cy);
@@ -502,7 +628,11 @@ el('map').addEventListener('click', async (e) => {
 
   const unit = STATE.units.find((u) => u.id === selected);
   if (!unit || STATE.you.submitted) return;
-  if (dist(unit.cx, unit.cy, cx, cy) > unit.moves) { selected = null; renderMap(STATE); return; }
+  if (!walkPath(STATE, unit.cx, unit.cy, cx, cy, unit.moves).length) {
+    selected = null;
+    renderMap(STATE);
+    return;
+  }
 
   // Optimistic: draw the order and drop the selection, then persist it.
   STATE.orders[unit.id] = [cx, cy];
@@ -534,7 +664,7 @@ function gameIdFromHash() {
 async function refreshGame() {
   const id = gameIdFromHash();
   if (id === null) return;
-  const { ok, data } = await api('/games/' + id + '/state');
+  const { ok, data } = await api('/games/' + id + '/state?as=' + encodeURIComponent(viewAs));
   if (!ok) { location.hash = '#/'; return; }
 
   const turnChanged = STATE && STATE.game.turn !== data.game.turn;

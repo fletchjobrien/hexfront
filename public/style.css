@@ -129,20 +129,37 @@ label input { margin-top: .25rem; }
 #zoom-level { min-width: 3.2rem; text-align: center; }
 
 /* The svg is sized in px by the zoom controls, so the board scrolls inside here. */
-#map-scroll { overflow: auto; max-height: 76vh; border-radius: 6px; }
+#map-scroll { overflow: auto; max-height: 76vh; border-radius: 6px; cursor: grab; }
+#map-scroll.grabbing { cursor: grabbing; }
 #map svg { display: block; height: auto; }
+
+/* Dragging the board must never start a text selection or drop a caret into
+   the numbers printed on the counters. */
+#map svg, #map svg text {
+  user-select: none; -webkit-user-select: none; -ms-user-select: none;
+}
 
 .unit-size {
   font: 700 11px ui-sans-serif, system-ui, sans-serif;
   fill: #0b0e13; text-anchor: middle; pointer-events: none;
 }
 
-.hex { stroke: #222a35; stroke-width: 1; }
-.hex.fog { fill: #0b0e13; }
-.hex.seen { fill: #232c39; }
-.hex.reach { fill: #35435a; }
-.hex.sel { stroke: var(--accent); stroke-width: 2.5; }
-.hex:hover { stroke: #59677d; }
+.legend { display: flex; align-items: center; gap: .3rem; font-size: .78rem; color: var(--muted); }
+.legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; margin-left: .5rem; }
+
+label.check {
+  display: flex; align-items: center; gap: .5rem;
+  margin: .6rem 0 0; font-size: .85rem;
+}
+label.check input { width: auto; }
+
+.hex { stroke: #1b2129; stroke-width: 1; }
+.hex:hover { stroke: #8fa2bb; }
+
+/* Drawn on top of the terrain so every hex keeps one uniform click target. */
+.overlay { pointer-events: none; }
+.overlay.reach { fill: rgba(226, 177, 60, .17); stroke: rgba(226, 177, 60, .35); }
+.overlay.sel { fill: none; stroke: var(--accent); stroke-width: 2.5; }
 
 .unit { pointer-events: none; }
 .unit-city { stroke: #0b0e13; stroke-width: 2; }
